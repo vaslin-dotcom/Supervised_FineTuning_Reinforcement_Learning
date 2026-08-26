@@ -51,11 +51,13 @@ Required dataset size formula:
 
 N_examples = (ratio × trainable_params) / (tokens_per_example × epochs)
 
+Considering 3 epochs
+
 | Rank | Ratio  | Required Examples |
 |---|-------|-------------------|
-| r = 4 | 10×   | ~8,621            |
-| r = 4 | 50×   | ~43,100           |
-| r = 8 | 10×   | ~17,200           |
-| r = 8 | 50×   | ~86,000           |
+| r = 4 | 10×   | ~3,000            |
+| r = 4 | 50×   | ~14,500           |
+| r = 8 | 10×   | ~6,500           |
+| r = 8 | 50×   | ~28,500           |
 
 **Decision:** Given free-tier API constraints, we start with a well-designed, diverse dataset of **~800–1,000 examples**, below the theoretical target, and rely on **held-out validation loss + early stopping** (rather than blind epoch count) to empirically catch overfitting during training. Additional *targeted* data is generated later only if error analysis after evaluation identifies specific, recurring failure modes — rather than blindly scaling the dataset upfront.
