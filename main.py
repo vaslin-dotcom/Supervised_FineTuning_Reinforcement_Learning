@@ -35,6 +35,7 @@ with open(OUTPUT_PATH, "a", encoding="utf-8") as f:
                 Target difficulty: {difficulty} (1=single obvious inference, 5=multiple interacting clues with several plausible-looking traps)
 
                 Rules:
+                    - Every fact used in `observations` MUST come from from a fact already stated in `problem` or known facts, don't include any assumptions.
                     - Every fact used in `observations`, `impossible_scenario` reasons, and `deduction` MUST come from `problem` or from a fact already stated in `observations`.
                     - Do NOT assert the absence, non-occurrence, or non-existence of something (e.g. "no alarm was triggered," "no delivery was scheduled," "records show nothing," "no footprints were found") unless a prior `observations` entry explicitly states that the relevant check, log review, or witness canvass was performed. If an absence is needed for the deduction, first add an observation stating the check happened, before using its result.
                     - Do not introduce new named entities, events, dates, or documents that are not present in `problem`.
