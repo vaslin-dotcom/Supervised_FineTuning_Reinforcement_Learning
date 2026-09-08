@@ -15,12 +15,13 @@ I am going to use LoRA for fine tuning
 | head_dim | 64 |
 | intermediate_size | 2560 |
 
-### 2. Why only `q_proj` and `v_proj`?
+### 2. Why `q_proj`, `v_proj`, and `gate_proj`?
 
-LoRA can target any linear projection in the transformer (`q_proj`, `k_proj`, `v_proj`, `o_proj` in attention; `gate_proj`, `up_proj`, `down_proj` in the MLP). We restrict adaptation to **`q_proj` and `v_proj` only**, for two reasons:
+LoRA can target any linear projection in the transformer (`q_proj`, `k_proj`, `v_proj`, `o_proj` in attention; `gate_proj`, `up_proj`, `down_proj` in the MLP). We adapt **`q_proj`, `v_proj`, and `gate_proj`**, for the following reasons:
 
-- **Task nature — format/style adaptation, not new-knowledge acquisition.** The model already knows the vocabulary and general reasoning ability it needs (from 4T pretraining tokens); what it needs to learn is a *behavioral pattern* — restructuring output into Observation → Possible/Eliminated Scenarios → Inference on mystery-style prompts. This is closer to "change what the model attends to and emphasizes" than "store new facts," which points toward attention-layer adaptation over MLP adaptation (MLP blocks are more associated with factual/knowledge storage in transformer interpretability research).
-- **Q and V are the highest-leverage attention components for this.** `q_proj` determines *what a token looks for* in the sequence (i.e., which attention pattern gets formed — directly relevant to learning "attend differently when the input is a mystery-style prompt"). `v_proj` determines *what content gets pulled forward* once attention is placed (relevant to changing output style/content). `k_proj` and `o_proj` contribute comparatively little extra behavioral leverage per the original LoRA paper's ablations, and in SmolLM2's GQA architecture, `k_proj`/`v_proj` are already shared across multiple query heads (5 KV-heads vs. 15 query heads), making `k_proj` a lower-precision lever to adapt. Excluding `k_proj`/`o_proj` also keeps trainable capacity conservative — important given our limited fine-tuning dataset (see below).
+- **Task nature — format/style adaptation, not new-knowledge acquisition, with added capacity for output shaping.** The model already knows the vocabulary and general reasoning ability it needs (from 4T pretraining tokens); what it needs to learn is a *behavioral pattern* — restructuring output into Observation → Possible/Eliminated Scenarios → Inference on mystery-style prompts. This points toward attention-layer adaptation over full MLP adaptation.
+- **Q and V are the highest-leverage attention components for this.** `q_proj` determines *what a token looks for* in the sequence (i.e., which attention pattern gets formed — directly relevant to learning "attend differently when the input is a mystery-style prompt"). `v_proj` determines *what content gets pulled forward* once attention is placed (relevant to changing output style/content). `k_proj` and `o_proj` contribute comparatively little extra behavioral leverage per the original LoRA paper's ablations, and in SmolLM2's GQA architecture, `k_proj`/`v_proj` are already shared across multiple query heads (5 KV-heads vs. 15 query heads), making `k_proj` a lower-precision lever to adapt.
+- **`gate_proj` is included for additional output-shaping capacity.** `gate_proj` sits in SmolLM2's gated MLP block and contributes to how strongly different learned features are expressed in the model's output. Including it gives the adapter more capacity to shift generation style/structure beyond what attention-only adaptation provides, which is useful given the low LoRA rank and modest dataset size used here. `up_proj`/`down_proj` are excluded to keep trainable capacity conservative.
 
 ### 3. Trainable Parameter Count
 
@@ -30,16 +31,17 @@ LoRA replaces a full weight update to `W` (shape `d_out × d_in`) with two low-r
 |---|---|---|---|
 | q_proj | 960 | 960 | 1920 |
 | v_proj | 960 | 320 | 1280 |
-| **Sum (q+v)** | | | **3200** |
+| gate_proj | 960 | 2560 | 3520 |
+| **Sum (q+v+gate)** | | | **6720** |
 
-Total trainable params = `num_layers × Σ(d_in+d_out) × r` = `32 × 3200 × r`
+Total trainable params = `num_layers × Σ(d_in+d_out) × r` = `32 × 6720 × r`
 
 | Rank (r) | Trainable Params | % of 360M model |
 |---|---|---|
-| r = 4 | 409,600 | ~0.11% |
-| r = 8 | 819,200 | ~0.23% |
+| r = 4 | 860,160 | ~0.24% |
+| r = 8 | 1,720,320 | ~0.48% |
 
-Both `r=4` and `r=8` adapters are trained and compared empirically via held-out evaluation (see Evaluation section).
+Both `r=4` and `r=8` adapters were trained and compared. **r=8 was selected** going forward, as r=4 did not perform well enough on the reasoning-structure task on qualitative review of generations.
 
 ### 4. Dataset Sizing Estimate
 
@@ -51,13 +53,19 @@ Required dataset size formula:
 
 N_examples = (ratio × trainable_params) / (tokens_per_example × epochs)
 
-Considering 3 epochs
+Training is run for **10 epochs**.
 
-| Rank | Ratio  | Required Examples |
-|---|-------|-------------------|
-| r = 4 | 10×   | ~3,000            |
-| r = 4 | 50×   | ~14,500           |
-| r = 8 | 10×   | ~6,500           |
-| r = 8 | 50×   | ~28,500           |
+| Rank | Ratio | Required Examples (10 epochs) |
+|---|---|---|
+| r = 4 | 10× | ~2,300 |
+| r = 4 | 15× | ~3,440 |
+| r = 8 | 10× | ~4,590 |
+| r = 8 | 15× | ~6,880 |
 
-**Decision:** Given free-tier API constraints, we start with a well-designed, diverse dataset of **~800–1,000 examples**, below the theoretical target, and rely on **held-out validation loss + early stopping** (rather than blind epoch count) to empirically catch overfitting during training. Additional *targeted* data is generated later only if error analysis after evaluation identifies specific, recurring failure modes — rather than blindly scaling the dataset upfront.
+**Actual dataset used:** 856 training examples, 120 validation examples. This sits below the 10× target for r=8 at 10 epochs, so held-out validation loss is monitored closely during training to catch overfitting given the dataset is smaller than the heuristic target for the chosen rank and target-module set.
+
+---
+
+## RL Phase
+
+*(To be added later — reward function design, GRPO setup, and results will be documented in a separate section once finalized.)*
