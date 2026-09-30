@@ -1,71 +1,135 @@
-I am going to create a model to reason like a detective
-I have chosen smolLM2 as the pretrained model for this, going to make it undergo a series of Fine Tuning and Reinforcement learning.
-I am going to use LoRA for fine tuning
+# 🕵️ Detective LLM: Teaching a Small Model to Reason Like a Detective
 
-## LoRA Configuration & Dataset Sizing — Calculations
+People kept asking me, "So AI engineering is just prompting, right?" This project is my answer. I fine-tuned a small language model (**SmolLM2-360M**) with **LoRA**, then tried to improve its reasoning with **reinforcement learning (GRPO)**. Given a short statement, the model responds in a fixed detective-style format.
 
-### 1. Model Architecture (SmolLM2-360M)
+This is a learning project, not a production model. The negative results are documented on purpose.
 
-| Parameter | Value |
-|---|---|
-| hidden_size | 960 |
-| num_hidden_layers | 32 |
-| num_attention_heads | 15 |
-| num_key_value_heads (GQA) | 5 |
-| head_dim | 64 |
-| intermediate_size | 2560 |
+## Example
 
-### 2. Why `q_proj`, `v_proj`, and `gate_proj`?
+**Input**
 
-LoRA can target any linear projection in the transformer (`q_proj`, `k_proj`, `v_proj`, `o_proj` in attention; `gate_proj`, `up_proj`, `down_proj` in the MLP). We adapt **`q_proj`, `v_proj`, and `gate_proj`**, for the following reasons:
+```
+<<STATEMENT>>
+Maria left home at 8 a.m. with an umbrella even though the sky was clear. When she came back in the evening, her clothes were soaked.
+```
 
-- **Task nature — format/style adaptation, not new-knowledge acquisition, with added capacity for output shaping.** The model already knows the vocabulary and general reasoning ability it needs (from 4T pretraining tokens); what it needs to learn is a *behavioral pattern* — restructuring output into Observation → Possible/Eliminated Scenarios → Inference on mystery-style prompts. This points toward attention-layer adaptation over full MLP adaptation.
-- **Q and V are the highest-leverage attention components for this.** `q_proj` determines *what a token looks for* in the sequence (i.e., which attention pattern gets formed — directly relevant to learning "attend differently when the input is a mystery-style prompt"). `v_proj` determines *what content gets pulled forward* once attention is placed (relevant to changing output style/content). `k_proj` and `o_proj` contribute comparatively little extra behavioral leverage per the original LoRA paper's ablations, and in SmolLM2's GQA architecture, `k_proj`/`v_proj` are already shared across multiple query heads (5 KV-heads vs. 15 query heads), making `k_proj` a lower-precision lever to adapt.
-- **`gate_proj` is included for additional output-shaping capacity.** `gate_proj` sits in SmolLM2's gated MLP block and contributes to how strongly different learned features are expressed in the model's output. Including it gives the adapter more capacity to shift generation style/structure beyond what attention-only adaptation provides, which is useful given the low LoRA rank and modest dataset size used here. `up_proj`/`down_proj` are excluded to keep trainable capacity conservative.
+**Output format**
 
-### 3. Trainable Parameter Count
+```
+<<OBSERVATIONS>>     what the statement actually says
+<<POSSIBILITIES>>    explanations consistent with the facts
+<<IMPOSSIBILITIES>>  explanations the facts rule out
+<<DEDUCTION>>        reasoning from the above
+<<FINAL ANSWER>>     the conclusion
+```
 
-LoRA replaces a full weight update to `W` (shape `d_out × d_in`) with two low-rank matrices `A (r × d_in)` and `B (d_out × r)`, giving `r × (d_in + d_out)` trainable parameters per matrix instead of `d_out × d_in`.
+> Add a screenshot of a real generation here: `![example](assets/example.png)`
 
-| Matrix | d_in | d_out | d_in + d_out |
+## Pipeline
+
+```
+Synthetic dataset  →  SFT with LoRA  →  RL (GRPO)  →  Evaluation & error analysis
+   (976 examples)     (format learned)   (reward design)      (in progress)
+```
+
+## Base model
+
+**SmolLM2-360M**: hidden size 960, 32 layers, 15 attention heads, 5 KV heads (GQA), head dim 64, MLP size 2560.
+
+## 1. Dataset
+
+- 986 examples generated with an LLM, filtered to **976** by removing examples over 1,222 tokens.
+- Each example has a `context` (crime/mystery, everyday logic, scientific reasoning, pure facts), a `difficulty` (1-5) and a `deduction`.
+- Formatted as `prompt` (`<<STATEMENT>>` + problem) and `target` (the five marker sections). An EOS token is appended to the target, and the prompt tokens are masked in the loss.
+- Split: **856 train / 120 validation** (random, seed 1).
+- **Caveat:** the targets are LLM-generated and not yet manually audited. The dataset is also far smaller than my own sizing estimate (see the calculations below).
+
+## 2. Supervised fine-tuning (LoRA)
+
+Shared settings: lr 2e-5, 10 epochs, batch size 10, LoRA dropout 0.05, fp16, early stopping (patience 2), best model chosen by validation loss.
+
+| Config | Target modules | Trainable params | Val loss | Token acc. | Result |
+|---|---|---|---|---|---|
+| r=4, α=8 | q, v | 409,600 | 1.628 | 0.632 | Rarely followed the format |
+| r=8, α=16 | q, v | 819,200 | 1.545 | 0.646 | Better loss, format still unreliable |
+| r=4, α=8 | q, v, gate_proj | 860,160 | _TODO_ | _TODO_ | **Format reliably learned** |
+
+### What I learned
+
+- I first restricted LoRA to `q_proj` and `v_proj`, reasoning that this task is about behavior and style rather than new knowledge. That turned out to be too little capacity for switching output format.
+- Adding **only `gate_proj`** (a one-variable change) made the model reliably produce all five sections in order, under greedy and sampled decoding.
+- Higher repetition penalty (1.3) produced junk on long generations. Greedy decoding with the q/v-only models looped.
+- **The remaining problem is content, not format.** The model invents details that are not in the statement and sometimes contradicts itself in the final answer.
+
+## 3. Reinforcement learning (GRPO)
+
+Starting point: the q/v + gate_proj checkpoint. Settings: group size G=4, 10 prompts per step, KL beta 0.05. RL prompts come from the 856 training examples, and evaluation uses the held-out 120.
+
+### Roadblocks
+
+1. **Reward hacking with a rule-based reward.** The model exploited the reward. In one pilot, a completion with circular reasoning and junk text after the final answer scored the highest reward in the batch. I stopped the run and fixed the reward.
+2. **LLM-as-judge on free APIs.** RL needs thousands of judge calls, and the rate limits made this unworkable.
+3. **Paid API credits ($5).** Still not enough for RL-scale judging.
+4. **Jev as a reward model.** [Jev](https://www.typesafe.ai) (TypeSafe AI) is a non-autoregressive model that returns probability distributions over typed answers instead of generating text. _TODO: what I asked it to judge, how I converted its probabilities into a reward, and what happened._
+
+### Rule-based reward design
+
+The reward is **multiplicative**, so one fatal flaw sinks the whole score:
+
+```
+reward = structure × groundedness × duplication × contradiction-free × distinctness
+```
+
+- **structure:** fraction of the 5 markers present. Hard-fails on stray markers, duplicate markers or wrong order.
+- **groundedness / contradiction:** sentence-embedding similarity (all-MiniLM-L6-v2, CPU only).
+- **duplication / distinctness:** penalizes copied text between sections, and possibilities identical to impossibilities.
+
+The similarity thresholds still need calibration against labeled data.
+
+### Result
+
+_TODO: add the outcome of the Jev-reward run (reward curve, or before/after generations). The model did not improve enough._
+
+## Findings
+
+- Format adherence and reasoning quality are separate problems. LoRA on the right modules solved the first, not the second.
+- A reward function will be exploited in ways you did not anticipate. Reading raw completions by hand caught what the reward numbers hid.
+- Scoring outputs at RL scale is limited by cost and rate limits, and the reward design matters at least as much as the algorithm.
+- A 360M model may not have the capacity for grounded multi-step reasoning.
+
+## Roadmap
+
+- [ ] Manually audit 15-20 training targets for groundedness
+- [ ] Build the evaluation suite (format adherence, groundedness, reasoning quality, sliced by context and difficulty)
+- [ ] Repeat the pipeline with a stronger base model
+- [ ] Calibrate the embedding-based reward against labeled data
+
+## LoRA sizing calculations
+
+Trainable parameters = layers × Σ(d_in + d_out) × r, with q_proj (960→960), v_proj (960→320) and gate_proj (960→2560).
+
+| Modules | Σ(d_in + d_out) | r=4 | r=8 |
 |---|---|---|---|
-| q_proj | 960 | 960 | 1920 |
-| v_proj | 960 | 320 | 1280 |
-| gate_proj | 960 | 2560 | 3520 |
-| **Sum (q+v+gate)** | | | **6720** |
+| q, v | 3,200 | 409,600 | 819,200 |
+| q, v, gate | 6,720 | 860,160 | 1,720,320 |
 
-Total trainable params = `num_layers × Σ(d_in+d_out) × r` = `32 × 6720 × r`
+Dataset sizing heuristic: total training tokens should be roughly 10-50× the trainable parameters. With ~375 tokens per example, that suggests ~8,600 examples for r=4 at 10×, and I used 976. I relied on validation loss and early stopping to catch overfitting.
 
-| Rank (r) | Trainable Params | % of 360M model |
-|---|---|---|
-| r = 4 | 860,160 | ~0.24% |
-| r = 8 | 1,720,320 | ~0.48% |
+## Repository structure
 
-Both `r=4` and `r=8` adapters were trained and compared. **r=8 was selected** going forward, as r=4 did not perform well enough on the reasoning-structure task on qualitative review of generations.
+| File | Purpose |
+|---|---|
+| `llm.py` | _TODO_ |
+| `main.py` | _TODO_ |
+| `schemas.py` | _TODO_ |
+| `notebooks/` | _TODO: SFT, RL and generation notebooks_ |
 
-### 4. Dataset Sizing Estimate
+## Setup
 
-**Assumption:** ~350–400 tokens per fully-formatted training example (problem + observations + possible/eliminated scenarios + inference + final answer). We use **375 tokens/example** as the working estimate.
+_TODO: Python version, `pip install -r requirements.txt`, and where to put API keys as environment variables (never commit keys)._
 
-**Guiding heuristic:** total training tokens (across all epochs) should be roughly **10–50×** the trainable parameter count to provide sufficient learning signal without over-memorizing a small dataset. This heuristic is typically calibrated for tasks that teach *new knowledge*; since our task is a lower-complexity *format/style* adaptation on top of an already-capable base model, we treat the **lower end (10–15×)** as a reasonable, defensible target rather than requiring the full 50×.
+Compute: Colab Pro and Kaggle GPUs (free tier for RL).
 
-Required dataset size formula:
+## Acknowledgements
 
-N_examples = (ratio × trainable_params) / (tokens_per_example × epochs)
-
-Training is run for **10 epochs**.
-
-| Rank | Ratio | Required Examples (10 epochs) |
-|---|---|---|
-| r = 4 | 10× | ~2,300 |
-| r = 4 | 15× | ~3,440 |
-| r = 8 | 10× | ~4,590 |
-| r = 8 | 15× | ~6,880 |
-
-**Actual dataset used:** 856 training examples, 120 validation examples. This sits below the 10× target for r=8 at 10 epochs, so held-out validation loss is monitored closely during training to catch overfitting given the dataset is smaller than the heuristic target for the chosen rank and target-module set.
-
----
-
-## RL Phase
-
-*(To be added later — reward function design, GRPO setup, and results will be documented in a separate section once finalized.)*
+Base model: [SmolLM2](https://huggingface.co/HuggingFaceTB/SmolLM2-360M) by Hugging Face.
